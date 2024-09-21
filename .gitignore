@@ -11,6 +11,7 @@ pymemchat-env/
 
 # Environment variables
 .env
+.cursorignore
 
 # JSON files
 *.json
