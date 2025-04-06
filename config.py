@@ -1,3 +1,4 @@
+# config.py
 import os
 from dotenv import load_dotenv
 
@@ -11,3 +12,6 @@ class Config:
     MODEL_NAME = "gpt-3.5-turbo"
     TEMPERATURE = 0.7
     MAX_TOKENS = 512
+
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY must be set in the environment variables.")
