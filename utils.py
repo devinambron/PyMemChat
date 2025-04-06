@@ -2,6 +2,7 @@
 import logging
 from typing import List, Dict, Union, Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, BaseMessage
+from langchain_community.chat_message_histories import ChatMessageHistory
 
 logger = logging.getLogger(__name__)
 
@@ -10,41 +11,46 @@ def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(level=level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-def process_memory_data(memory_data: Union[Dict[str, Union[str, List[Dict[str, str]]]], List]) -> List[BaseMessage]:
-    """Process memory data from file into message objects"""
-    processed_messages = []
+def process_memory_data(memory_data: List[Dict[str, str]]) -> List[BaseMessage]:
+    """
+    Process memory data from file into Langchain message objects.
     
-    if isinstance(memory_data, dict):
-        for key, value in memory_data.items():
-            if isinstance(value, list):
-                for message in value:
-                    if message.get('role') == 'user':
-                        processed_messages.append(HumanMessage(content=message['content']))
-                    elif message.get('role') == 'ai' or message.get('role') == 'assistant':
-                        processed_messages.append(AIMessage(content=message['content']))
-                    else:
-                        logger.warning(f"Unknown role '{message.get('role')}' in message: {message}")
-            elif isinstance(value, str):
-                processed_messages.append(SystemMessage(content=value))
-    elif isinstance(memory_data, list):
-        for message in memory_data:
-            if isinstance(message, dict):
-                if message.get('role') == 'user':
-                    processed_messages.append(HumanMessage(content=message['content']))
-                elif message.get('role') == 'ai' or message.get('role') == 'assistant':
-                    processed_messages.append(AIMessage(content=message['content']))
-                elif message.get('role') == 'system':
-                    processed_messages.append(SystemMessage(content=message['content']))
-                else:
-                    logger.warning(f"Unknown role '{message.get('role')}' in message: {message}")
-            elif isinstance(message, str):
-                processed_messages.append(SystemMessage(content=message))
-            else:
-                logger.warning(f"Unexpected message format: {message}")
-    else:
-        logger.warning(f"Unexpected memory data format: {memory_data}")
+    Args:
+        memory_data: List of dictionaries with role and content keys
+        
+    Returns:
+        List of BaseMessage objects
+    """
+    # Create a ChatMessageHistory to handle the conversion
+    history = ChatMessageHistory()
     
-    return processed_messages
+    if not memory_data:
+        return history.messages
+        
+    # Add messages to history in order
+    for message in memory_data:
+        if not isinstance(message, dict):
+            logger.warning(f"Unexpected message format, expecting dict: {message}")
+            continue
+            
+        role = message.get('role')
+        content = message.get('content')
+        
+        if not role or not content:
+            logger.warning(f"Message missing role or content: {message}")
+            continue
+            
+        if role == 'user':
+            history.add_user_message(content)
+        elif role == 'ai' or role == 'assistant':
+            history.add_ai_message(content)
+        elif role == 'system':
+            # Convert system messages separately as ChatMessageHistory doesn't handle them
+            history.messages.append(SystemMessage(content=content))
+        else:
+            logger.warning(f"Unknown role '{role}' in message: {message}")
+    
+    return history.messages
 
 def sanitize_user_input(user_input: str) -> str:
     """Clean user input to prevent issues"""

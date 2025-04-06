@@ -81,3 +81,81 @@ Contributions are welcome! Please feel free to submit a pull request or open an 
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+# PyMemChat Test Suite
+
+This directory contains comprehensive tests for the PyMemChat chatbot application, focusing on memory persistence and retrieval across chat sessions.
+
+## Test Components
+
+The test suite consists of the following files:
+
+1. `test_chatbot.py` - Tests for the Chatbot class functionality
+2. `test_memory_manager.py` - Tests for the MemoryManager class functionality
+3. `run_tests.py` - A script to run all tests with detailed output
+
+## Test Coverage
+
+The tests cover the following scenarios:
+
+- Basic conversation functionality
+- Memory persistence within a single session
+- Memory persistence across multiple sessions
+- Entity recognition and recall
+- Context retrieval from previous conversations
+- Various memory components (summary, entity memory, vector store)
+
+## Running the Tests
+
+### Prerequisites
+
+Make sure you have installed all the required dependencies and have set up the virtual environment as per the main project instructions.
+
+### Running All Tests
+
+To run all tests, use the `run_tests.py` script:
+
+```bash
+python run_tests.py
+```
+
+This will run all test cases with detailed output.
+
+### Running Individual Test Files
+
+You can also run individual test files:
+
+```bash
+python -m unittest test_chatbot.py
+python -m unittest test_memory_manager.py
+```
+
+### Running Specific Test Cases
+
+To run a specific test case:
+
+```bash
+python -m unittest test_chatbot.TestChatbot.test_basic_conversation
+python -m unittest test_memory_manager.TestMemoryManager.test_add_message
+```
+
+## Test Design
+
+The tests use Python's `unittest` framework and include:
+
+- Mock objects for LLM and API dependencies
+- Temporary files for memory storage
+- Patching of external dependencies
+
+## Troubleshooting
+
+If you encounter any issues running the tests:
+
+1. Ensure your virtual environment is activated
+2. Check that all dependencies are installed
+3. Confirm that the main application code is functioning properly
+4. Look for any error messages in the test output
+
+## Adding New Tests
+
+When adding new functionality to the chatbot, please add corresponding tests to maintain code coverage.
