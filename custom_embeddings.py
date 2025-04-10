@@ -1,8 +1,8 @@
 # custom_embeddings.py
 import httpx
 import logging
-from langchain.embeddings.base import Embeddings
-from typing import List
+from langchain_core.embeddings import Embeddings
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -10,7 +10,7 @@ class NomicEmbeddings(Embeddings):
     def __init__(
         self,
         api_base: str,
-        api_key: str = None,
+        api_key: Optional[str] = None,
         model: str = "nomic-ai/nomic-embed-text-v1.5-GGUF",
     ):
         """

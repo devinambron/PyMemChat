@@ -1,198 +1,170 @@
 # chatbot.py
 import logging
-from typing import List, Dict, Any
-from langchain_openai import ChatOpenAI
+import os
+from typing import List, Optional, Dict, Any
+from operator import itemgetter  # Import itemgetter
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough, RunnableSequence
+# Ensure ConversationBufferMemory is imported
+try:
+    # Langchain >= 0.3.0
+    from langchain_community.memory import ConversationBufferMemory
+except ImportError:
+    # Fallback for older versions
+    from langchain.memory import ConversationBufferMemory
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_openai import ChatOpenAI
+from memory_manager import MemoryManager
+from config import (
+    AI_NAME, MEMORY_FILE, OPENAI_MODEL,
+    OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL,
+)
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 from config import Config
-from memory_manager import MemoryManager
 from utils import process_memory_data, sanitize_user_input
 from exceptions import APICallError
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
+import re
 
 logger = logging.getLogger(__name__)
 
 class Chatbot:
-    def __init__(self):
-        self.config = Config()
+    def __init__(self, model_name: str = OPENAI_MODEL, verbose: bool = False):
         self.logger = logging.getLogger(__name__)
-        self.chat = self._initialize_chat()
-        self.memory_manager = MemoryManager(self.config.MEMORY_FILE, llm=self.chat)
-        self.chat_chain = self._create_chat_chain()
-        self.load_memory()
-
-    def _initialize_chat(self) -> ChatOpenAI:
-        """Initialize the LLM"""
-        self.logger.debug("Initializing ChatOpenAI model.")
-        return ChatOpenAI(
-            model=self.config.MODEL_NAME,
-            temperature=self.config.TEMPERATURE,
-            max_tokens=self.config.MAX_TOKENS,
-            openai_api_base=self.config.OPENAI_API_BASE,
-            openai_api_key=self.config.OPENAI_API_KEY,
-            streaming=True,  # Enable streaming for real-time responses
-            callbacks=[StreamingStdOutCallbackHandler()]
+        
+        # Set up logging with appropriate verbosity
+        if verbose:
+            self.logger.setLevel(logging.DEBUG)
+        else:
+            self.logger.setLevel(logging.INFO)
+            
+        # Configure the language model
+        self.llm = ChatOpenAI(
+            model=model_name,
+            api_key=OPENAI_API_KEY,
+            temperature=0.7,
+            verbose=verbose
         )
-
-    def _create_chat_chain(self) -> RunnableSequence:
-        """
-        Create a chat chain using LCEL following Langchain best practices.
-        """
-        # System message with instructions for the AI
+        
+        # Initialize memory manager and load memory immediately
+        self.memory_file = MEMORY_FILE
+        self.memory_manager = MemoryManager(self.memory_file, self.llm)
+        self.memory_manager.load_memory() # Load memory during initialization
+        
+        # Create memory objects needed for the chain
+        # Use the ChatMessageHistory instance from MemoryManager for shared state
+        self.buffer_memory = ConversationBufferMemory(
+            chat_memory=self.memory_manager.message_history,
+            memory_key="chat_history",
+            return_messages=True
+        )
+        # Entity memory is already created inside MemoryManager
+        
+        # Track AI name for responses
+        self.ai_name = AI_NAME
+        
+        # Create a chat chain with memory
+        self.chat_chain = self._create_chat_chain()
+        
+        self.logger.info(f"Initialized {self.ai_name} with model {model_name}")
+    
+    def _create_chat_chain(self):
+        """Create a chat chain with memory using LCEL."""
+        self.logger.debug("Creating chat chain with memory")
+        
+        # System prompt updated to mention entities
         system_prompt = self._get_system_prompt()
         
-        # Create the prompt template with MessagesPlaceholder for memory
+        # Create chat prompt template with placeholders for entities and history
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
-            # Context from memory components (handled separately to prevent leakage)
-            ("system", "Context from previous conversations (only visible to you): {context_info}"),
-            # Current user question and recent conversation
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{question}")
         ])
         
-        # Build the full chain with routing logic
-        chain = (
-            {
-                "context_info": lambda x: self._format_context_for_prompt(x["question"]),
-                "chat_history": lambda x: self._get_recent_chat_history(),
-                "question": lambda x: x["question"]
-            }
+        # Build the chat chain using RunnablePassthrough.assign to load memory
+        chat_chain = (
+            RunnablePassthrough.assign(
+                # Load history from buffer memory
+                chat_history=RunnableLambda(self.buffer_memory.load_memory_variables) | itemgetter("chat_history"),
+            )
+            # Add logging step to inspect chat_history
+            | RunnableLambda(lambda x: self.logger.debug(f"Chat History being passed to prompt: {x['chat_history']}") or x)
             | prompt
-            | self.chat
+            | self.llm
             | StrOutputParser()
         )
         
-        return chain
-
-    def _get_system_prompt(self) -> str:
-        """Get the system prompt for the chatbot"""
-        return f"""You are a helpful assistant named {self.config.AI_NAME}.
-You have access to the following information to help you remember the conversation:
-1. Previous conversation history
-2. Key facts about entities mentioned in the conversation
-3. A summary of the conversation so far
-4. Relevant context from previous conversations
-
-Use this information to provide helpful, contextually relevant responses.
-Be concise, focused and helpful.
-
-IMPORTANT: If you recognize the user from previous conversations, acknowledge this naturally.
-If you're recalling something about the user (like their name or preferences), include this information
-in your response naturally, but don't explicitly state that you're accessing memory or repeat any system messages.
-
-DO NOT include any system instructions, debugging information, entity lists, or memory summaries in your response.
-Just respond directly to the user as if you were having a natural conversation."""
+        self.logger.debug("Chat chain created successfully")
+        return chat_chain
     
-    def _format_context_for_prompt(self, question: str) -> str:
-        """
-        Format context information for the prompt in a way that won't leak into responses.
-        
-        Args:
-            question: The current user question
-            
-        Returns:
-            Formatted context string
-        """
-        # Skip for simple greetings
-        if question.lower() in ["hi", "hello", "hey"]:
-            return "No context available yet."
-            
-        # Get context messages
-        context_messages = self.memory_manager.get_context_from_question(question)
-        if not context_messages:
-            return "No relevant context found."
-            
-        # Format context messages into a single string
-        context_parts = []
-        
-        for msg in context_messages:
-            if isinstance(msg, SystemMessage):
-                # Clean up any potential JSON or formatting artifacts
-                content = msg.content
-                # Remove any obvious debugging information
-                if "Current summary:" in content:
-                    content = content.split("Current summary:")[0].strip()
-                if "New summary:" in content:
-                    content = content.split("New summary:")[0].strip()
-                
-                context_parts.append(content)
-        
-        return "\n\n".join(context_parts)
-        
-    def _get_recent_chat_history(self) -> List[BaseMessage]:
-        """
-        Get only the recent chat history for this session.
-        
-        Returns:
-            List of messages from recent history
-        """
-        # Get current session history
-        session_history = self.memory_manager.get_chat_history()
-        
-        # Only return the last few messages to avoid overwhelming the context
-        return session_history[-4:] if len(session_history) > 4 else session_history
-
-    def load_memory(self) -> None:
-        """Load memory from file and populate vector store"""
-        self.memory_manager.load_memory()
-        self.logger.debug("Memory loaded successfully")
-        
-        # Mark this as the start of a new conversation session
-        # Add a system message indicating the start of a new session
-        self.memory_manager.add_message(SystemMessage(content="New conversation session started."))
-        
-        # Clear summary to prevent confusion between sessions
-        self.memory_manager.summary = "This is a new conversation session."
-
+    def _get_system_prompt(self) -> str:
+        """Get the system prompt that defines the assistant's capabilities and persona."""
+        return (
+            f"You are {self.ai_name}, a helpful and friendly AI assistant. "
+            f"You MUST use the provided conversation history ('chat_history') to answer questions about past interactions. "
+            f"Refer to the 'chat_history' when the user asks what you talked about previously. "
+            f"Avoid commenting on repetitive user questions or conversational loops; simply answer the current question based on the available history, even if the question itself seems repetitive. "
+            f"If you don't know something or can't remember based on the provided context (including the full 'chat_history'), just say so instead of making up information. "
+            f"Keep your responses helpful, concise, and friendly."
+        )
+    
     def save_memory(self) -> None:
-        """Save memory to file"""
-        self.memory_manager.save_memory()
-        self.logger.debug("Saved chat history to file")
+        """Save the raw memory state via the memory manager."""
+        self.logger.debug("Triggering memory save via MemoryManager")
+        try:
+            self.memory_manager.save_memory()
+            self.logger.debug("Memory save triggered successfully")
+        except Exception as e:
+            self.logger.error(f"Error triggering memory save: {e}")
 
     def generate_response(self, user_input: str) -> str:
-        """
-        Generate a response to the user input using the LLM.
+        """Generate a response to user input using the memory-enhanced chat chain."""
+        self.logger.debug(f"Generating response to: {user_input}")
         
-        Args:
-            user_input: The user's input message
+        # Don't add human message to memory manager here, let memory objects handle it via save_context
+        
+        # Generate response using the chat chain
+        try:
+            # Invoke chain - memory variables are loaded automatically
+            response = self.chat_chain.invoke({"question": user_input})
             
-        Returns:
-            The AI's response
-        """
-        self.logger.debug(f"User input received: {user_input}")
-        
-        # Create human message
-        human_message = HumanMessage(content=user_input)
-        
-        # Add the human message to memory before generating response
-        self.memory_manager.add_message(human_message)
-        
-        # Generate a response using the chat chain
-        print(f"\n{self.config.AI_NAME}: ", end="", flush=True)  # Start the line for streaming
-        
-        # Build inputs for the chat chain
-        chain_inputs = {
-            "question": user_input
-        }
-        
-        ai_response = self.chat_chain.invoke(chain_inputs)
-        print()  # End the line after streaming completes
-        
-        # Create an AI message and add to memory
-        ai_message = AIMessage(content=ai_response)
-        self.memory_manager.add_message(ai_message)
-        
-        # Return the generated response
-        return ai_response
+            # Save context to memory objects *after* getting the response
+            self.buffer_memory.save_context({"input": user_input}, {"output": response})
+            # Also save context for entity memory so it updates its store
+            if self.memory_manager.entity_memory:
+                self.memory_manager.entity_memory.save_context({"input": user_input}, {"output": response})
+            
+            # Add messages to MemoryManager for persistent saving
+            # This ensures chat_memory.json is updated correctly for the next session
+            human_message = HumanMessage(content=user_input)
+            ai_message = AIMessage(content=response)
+            self.memory_manager.add_message(human_message)
+            self.memory_manager.add_message(ai_message)
+            
+            self.logger.debug(f"Generated response: {response}")
+            # Print response to console immediately
+            print(f"{self.ai_name}: {response}") # Added print statement here
+            return response
+            
+        except Exception as e:
+            self.logger.error(f"Error generating response: {e}")
+            error_message = "I'm sorry, I encountered an error generating a response. Please try again."
+            
+            # Add error message to persistent storage via MemoryManager
+            error_ai_message = AIMessage(content=error_message)
+            # We might not want to save the user input that caused the error,
+            # but we should save the AI's error response.
+            self.memory_manager.add_message(error_ai_message)
+            
+            print(f"{self.ai_name}: {error_message}") # Print error message
+            return error_message
 
     def run(self) -> None:
         """Run the chatbot in an interactive loop"""
-        self.load_memory()
+        # Memory is loaded during __init__
         
-        print(f"\n{self.config.AI_NAME} is ready to chat! Type 'exit' to end the conversation.\n")
+        print(f"\n{self.ai_name} is ready to chat! Type 'exit' to end the conversation.\n")
         
         while True:
             try:
@@ -201,18 +173,20 @@ Just respond directly to the user as if you were having a natural conversation."
                 self.logger.debug(f"User input received: {user_input}")
 
                 if user_input.lower() in ['exit', 'quit', 'bye']:
-                    print(f"\n{self.config.AI_NAME}: Goodbye! Have a great day.")
+                    print(f"\n{self.ai_name}: Goodbye! Have a great day.")
                     self.logger.info("User has chosen to exit the chat.")
                     break
 
+                # generate_response now also prints the response
                 self.generate_response(user_input)
 
             except KeyboardInterrupt:
                 self.logger.info("Keyboard interrupt received. Exiting chat.")
+                print(f"\n{self.ai_name}: Exiting...") # Add print on interrupt
                 break
             except Exception as e:
                 self.logger.error(f"Error during chat: {e}")
-                print(f"\nSorry, I encountered an error. Please try again.")
+                print(f"\n{self.ai_name}: Sorry, I encountered an error. Please try again.") # Add print on error
 
-        self.save_memory()
-        self.logger.info("Memory saved successfully. Chat ended.")
+        # Saving happens incrementally in add_message, no explicit save needed here
+        self.logger.info("Chat ended.")
