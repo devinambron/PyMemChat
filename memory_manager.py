@@ -16,26 +16,27 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 
 # Import memory components from their correct locations
-try:
-    # Langchain >= 0.3.0
-    from langchain_community.memory import (
-        ConversationBufferMemory, 
-        ConversationSummaryMemory,
-        ConversationSummaryBufferMemory,
-        ConversationEntityMemory,
-        CombinedMemory,
-        VectorStoreRetrieverMemory
-    )
-except ImportError:
-    # Fallback for older versions
-    from langchain.memory import (
-        ConversationBufferMemory, 
-        ConversationSummaryMemory,
-        ConversationSummaryBufferMemory,
-        ConversationEntityMemory,
-        CombinedMemory,
-        VectorStoreRetrieverMemory
-    )
+# REMOVED deprecated memory class imports - these will be handled differently
+# try:
+#     # Langchain >= 0.3.0
+#     from langchain_community.memory import (
+#         ConversationBufferMemory, 
+#         ConversationSummaryMemory,
+#         ConversationSummaryBufferMemory,
+#         ConversationEntityMemory,
+#         CombinedMemory,
+#         VectorStoreRetrieverMemory
+#     )
+# except ImportError:
+#     # Fallback for older versions
+#     from langchain.memory import (
+#         ConversationBufferMemory, 
+#         ConversationSummaryMemory,
+#         ConversationSummaryBufferMemory,
+#         ConversationEntityMemory,
+#         CombinedMemory,
+#         VectorStoreRetrieverMemory
+#     )
 
 logger = logging.getLogger(__name__)
 
@@ -44,132 +45,75 @@ class MemoryManager:
         self.file_path = file_path
         self.logger = logging.getLogger(__name__)
         
-        # Initialize the language model
+        # Initialize the language model (still needed for summarization)
         self.llm = llm
         
         # Create a vector store for semantic search
         self.vector_store = create_vector_store()
-        self.vector_retriever = self.vector_store.as_retriever(
-            search_kwargs={"k": 3} # Reduced k for context relevance
-        )
+        if self.vector_store:
+            self.vector_retriever = self.vector_store.as_retriever(
+                search_kwargs={"k": 3} # Reduced k for context relevance
+            )
+        else:
+            self.vector_retriever = None
+            self.logger.warning("Vector store could not be initialized. Retrieval features will be disabled.")
         
         # Chat histories - store as raw dicts for serialization
         self.chat_history = []  # For persistently stored messages
-        self.current_session_history = []  # For this session
+        self.current_session_history = []  # For raw messages added this session before saving
         
-        # Current session memory - store as ChatMessageHistory for LCEL compatibility
+        # LCEL-compatible message history object. This will be managed by RunnableWithMessageHistory.
         self.message_history = ChatMessageHistory()
         
-        # Initialize ConversationEntityMemory
-        # Use the same message_history for shared state
-        if self.llm:
-            self.entity_memory = ConversationEntityMemory(
-                llm=self.llm,
-                chat_history=self.message_history,
-                memory_key="entities", # Standard key for entity memory
-                return_messages=False # Return summary string, not messages
-            )
-        else:
-            self.entity_memory = None # No LLM, no entity memory
+        # REMOVED Initialization of deprecated ConversationEntityMemory
+        # self.entity_memory = None # Not needed here anymore
         
-        # Initialize ConversationSummaryBufferMemory (uses message_history)
-        # Configured for large context window as per Task 2A
-        if self.llm:
-            self.summary_buffer_memory = ConversationSummaryBufferMemory(
-                llm=self.llm,
-                chat_message_history=self.message_history, # Link to the shared history
-                max_token_limit=80000, # Utilize large context window
-                memory_key="chat_history", # Standard key for chat history
-                return_messages=True # Return BaseMessage objects for LCEL
-            )
-        else:
-            # Provide a fallback or raise an error if LLM is needed but not provided
-            self.logger.warning("LLM not provided, ConversationSummaryBufferMemory requires an LLM. Falling back to basic history or potentially erroring.")
-            # Decide on fallback behavior: maybe a simple buffer or raise error
-            # For now, let's set it to None, but Chatbot logic must handle this.
-            self.summary_buffer_memory = None
+        # REMOVED Initialization of deprecated ConversationSummaryBufferMemory
+        # self.summary_buffer_memory = None # Not needed here anymore
         
-        # Conversation summary (still potentially useful for simple context)
+        # Simple summary storage (if still desired for basic context)
         self.summary = ""
         
-        # Flag to control whether to process and print summaries
+        # Flag to control whether to process and print summaries (currently unused)
         self.silent_mode = True
         
-        # Process previous messages - delayed until needed
+        # Status flag
         self.session_started = False
     
-    def _create_condense_question_chain(self) -> RunnableSequence:
-        """Create a chain that reformulates questions based on chat history"""
-        condense_q_system_prompt = """Given a chat history and the latest user question 
-which might reference the chat history, formulate a standalone question 
-which can be understood without the chat history. Do NOT answer the question, 
-just reformulate it if needed and otherwise return it as is."""
-        
-        condense_q_prompt = ChatPromptTemplate.from_messages([
-            ("system", condense_q_system_prompt),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{question}")
-        ])
-        
-        return condense_q_prompt | self.llm | StrOutputParser()
-    
-    def _create_entity_extraction_chain(self) -> RunnableSequence:
-        """Create a chain that extracts entities from conversations"""
-        entity_system_prompt = """Extract and summarize information about entities (people, places, concepts) 
-mentioned in the conversation. Return a JSON-formatted string with entity names as keys and their descriptions as values.
-Focus only on the most important details for each entity. If no entities are present, return an empty JSON object.
-Pay special attention to the user's name and personal details that should be remembered across conversations."""
-        
-        entity_prompt = ChatPromptTemplate.from_messages([
-            ("system", entity_system_prompt),
-            MessagesPlaceholder(variable_name="chat_history"),
-        ])
-        
-        return entity_prompt | self.llm | StrOutputParser()
-    
-    def _create_summary_chain(self) -> RunnableSequence:
-        """Create a chain that summarizes the conversation"""
-        summary_system_prompt = """Progressively summarize the conversation provided, 
-adding onto the previous summary and adding new information from the new messages.
-If there's no previous summary, create a new summary. Keep the summary concise."""
-        
-        summary_prompt = ChatPromptTemplate.from_messages([
-            ("system", summary_system_prompt),
-            ("human", "Previous summary: {prev_summary}\n\nNew messages:\n{new_messages}\n\nNew summary:")
-        ])
-        
-        return summary_prompt | self.llm | StrOutputParser()
+    # REMOVED unused chain creation methods (_create_condense_question_chain, etc.)
+    # These chains are now primarily defined within the Chatbot class using LCEL directly.
 
     def load_memory(self) -> None:
-        """Load memory from file storage and populate memory objects."""
+        """Load memory from file storage and populate the message_history object."""
         self.logger.debug(f"Loading memory from file: {self.file_path}")
         try:
-            # Set silent mode to prevent automatic processing
-            self.silent_mode = True
-            
-            # Check if file exists first
+            # Reset histories before loading
+            self.chat_history = []
+            self.current_session_history = []
+            self.message_history.clear()
+            memory_data = []
+
             try:
                 with open(self.file_path, 'r') as f:
                     memory_data = json.load(f)
-                self.chat_history = memory_data
-                self.current_session_history = []  # Start with empty current session
+                self.chat_history = memory_data # Store raw loaded data
+                self.logger.info(f"Loaded {len(self.chat_history)} raw messages from {self.file_path}")
             except FileNotFoundError:
-                self.logger.warning("Memory file not found, initializing empty memory.")
-                self.chat_history = []
-                self.current_session_history = []
-                memory_data = [] # Ensure memory_data is empty list
+                self.logger.warning(f"Memory file {self.file_path} not found, initializing empty memory.")
             except json.JSONDecodeError as e:
-                self.logger.error(f"Error decoding memory file: {e}")
-                raise MemoryLoadError(f"Error decoding memory file: {e}")
+                self.logger.error(f"Error decoding memory file {self.file_path}: {e}")
+                # Optionally, create a backup or handle the corrupted file
+                # For now, proceed with empty memory
             
-            # Populate vector store with messages
+            # Populate vector store with messages from loaded history
             if memory_data and self.vector_store:
                 self.logger.debug("Populating vector store with existing messages")
                 documents = []
                 for msg in memory_data:
-                    # Ensure content exists and is string
                     content = msg.get('content')
+                    # Add only user/AI messages with decent length to vector store
                     if msg.get('role') in ['user', 'ai'] and content and isinstance(content, str) and len(content) > 10:
+                        # TODO: Consider adding metadata (timestamp, role) to Document?
                         documents.append(Document(page_content=content))
                 if documents:
                     self.logger.debug(f"Adding {len(documents)} documents to vector store")
@@ -178,69 +122,33 @@ If there's no previous summary, create a new summary. Keep the summary concise."
                     except Exception as e:
                         self.logger.error(f"Error adding documents to vector store: {e}")
             
-            # Populate message history and entity memory from loaded data
+            # Populate message_history object for LCEL from loaded raw data
             processed_messages = process_memory_data(memory_data)
             if processed_messages:
-                self.logger.debug(f"Populating message history and entity memory with {len(processed_messages)} messages")
-                # Clear existing histories first
-                self.message_history.clear()
-                if self.entity_memory:
-                    self.entity_memory.clear()
-                
-                # Add messages sequentially to build history and entities
-                for i in range(0, len(processed_messages), 2):
-                    human_msg = processed_messages[i]
-                    ai_msg = processed_messages[i+1] if (i+1) < len(processed_messages) else None
-                    
-                    self.message_history.add_message(human_msg)
-                    if ai_msg:
-                        self.message_history.add_message(ai_msg)
-                        # Use save_context to populate entity memory from historical data
-                        if self.entity_memory:
-                            try:
-                                # Use save_context to allow entity extraction from past messages
-                                self.entity_memory.save_context(
-                                    {"input": human_msg.content},
-                                    {"output": ai_msg.content}
-                                )
-                            except Exception as e:
-                                self.logger.warning(f"Error processing historical context into entity memory: {e}")
-                    else:
-                        # Handle case with odd number of messages (last human message)
-                        if self.entity_memory:
-                            try:
-                                # Use save_context even for single input to potentially extract entities
-                                self.entity_memory.save_context({"input": human_msg.content}, {"output": ""})
-                            except Exception as e:
-                                self.logger.warning(f"Error processing final human message into entity memory: {e}")
+                self.logger.debug(f"Populating message_history with {len(processed_messages)} BaseMessage objects")
+                self.message_history.add_messages(processed_messages)
+                # Note: Entity extraction from history is removed here. 
+                # If needed, it would require a separate process or integration elsewhere.
             
-            self.logger.debug(f"Memory loaded successfully: {len(memory_data)} messages processed")
+            self.logger.debug(f"Memory loaded: {len(self.chat_history)} raw messages, {len(self.message_history.messages)} BaseMessages in history object.")
             
-            # Summary generation logic (keep as is or replace with ConversationSummaryMemory)
-            if memory_data and len(memory_data) >= 5:
-                # Look for existing summary patterns in the data
-                for msg in memory_data:
-                    if msg.get('role') == 'system' and 'conversation summary' in msg.get('content', '').lower():
-                        summary_text = msg.get('content', '')
-                        if ':' in summary_text:
-                            self.summary = summary_text.split(':', 1)[1].strip()
-                            break
-                
-                # If no summary found, create a basic one without LLM calls
-                if not self.summary:
-                    self.summary = "Previous conversations loaded."
+            # Simple summary flag (no actual summary generation here)
+            if memory_data:
+                 self.summary = "Previous conversations loaded."
+            else:
+                self.summary = ""
             
         except Exception as e:
             self.logger.error(f"Unexpected error loading memory: {e}", exc_info=True)
+            # Reset to safe state
             self.chat_history = []
             self.current_session_history = []
             self.message_history.clear()
-            if self.entity_memory:
-                self.entity_memory.clear()
+            self.summary = ""
+            # Re-raise or handle as appropriate? For now, log and continue.
             
         finally:
-            # Ensure silent mode is off after loading
-            self.silent_mode = False
+            self.silent_mode = False # Allow normal operation
             self.session_started = True
             
     def create_and_store_session_summary(self, messages: List[BaseMessage]) -> None:
@@ -258,6 +166,7 @@ If there's no previous summary, create a new summary. Keep the summary concise."
         self.logger.debug(f"Starting summary generation for {len(messages)} messages.")
         
         # Format messages for the prompt
+        # Use type attribute for role
         formatted_messages = "\n".join([f"{msg.type.upper()}: {msg.content}" for msg in messages])
         
         # Define summarization prompt
@@ -265,7 +174,8 @@ If there's no previous summary, create a new summary. Keep the summary concise."
             ("system", 
              "You are an expert in summarizing conversations. Analyze the following conversation transcript. "
              "Extract key facts learned about the user (e.g., name, specific preferences like favorite color, stated goals, significant life events mentioned), "
-             "and identify the main topics discussed. Generate a concise summary focusing *only* on information crucial for remembering the user "
+             "and identify the main topics discussed. **Synthesize related information; for example, if the user mentions details about their location multiple times, provide a single consolidated fact.** "
+             "Generate a concise summary focusing *only* on information crucial for remembering the user "
              "and maintaining context in future interactions. Structure the output clearly, perhaps using bullet points for facts/preferences. "
              "Do not include conversational fluff. If no significant new information was revealed, state that clearly."
             ),
@@ -290,8 +200,11 @@ If there's no previous summary, create a new summary. Keep the summary concise."
                 )
                 
                 # Add to vector store
-                self.vector_store.add_documents([summary_doc])
-                self.logger.info("Session summary added to vector store.")
+                if self.vector_store:
+                    self.vector_store.add_documents([summary_doc])
+                    self.logger.info("Session summary added to vector store.")
+                else:
+                    self.logger.warning("Vector store not available, cannot add summary document.")
             else:
                 self.logger.info("Summary deemed not significant enough or empty; not adding to vector store.")
                 
@@ -299,61 +212,60 @@ If there's no previous summary, create a new summary. Keep the summary concise."
             self.logger.error(f"Error during summary generation or storage: {e}", exc_info=True)
 
     def add_message(self, message: BaseMessage) -> None:
-        """Add a message to the raw chat history for persistent saving and update vector store (for raw messages)."""
+        """Add a message to the raw chat history list (for persistent saving)."""
+        # This method ONLY updates the list used for JSON saving.
+        # It does NOT update self.message_history (LCEL object) - that's handled by RunnableWithMessageHistory.
         try:
+            if not isinstance(message, (HumanMessage, AIMessage, SystemMessage)):
+                self.logger.warning(f"Attempted to add unsupported message type: {type(message)}")
+                return
+
             message_dict = {
-                "role": "user" if isinstance(message, HumanMessage) else "ai" if isinstance(message, AIMessage) else "system",
+                "role": message.type, # Use .type for role consistently
                 "content": message.content
             }
             # Add to the list that gets saved to JSON
             self.current_session_history.append(message_dict)
-            self.logger.debug(f"Added message to current raw session history: {message.content}")
+            self.logger.debug(f"Added message to current raw session history: Role={message.type}, Content='{message.content[:50]}...'")
 
-            # Add to vector store if applicable
-            if self.vector_store and isinstance(message.content, str) and len(message.content) > 10 and not isinstance(message, SystemMessage) and not message.content.lower().startswith(("hi", "hello")):
+            # Add raw message content to vector store (consider relevance/length filters)
+            # Avoid adding short greetings or system messages unless desired.
+            if self.vector_store and isinstance(message.content, str) and len(message.content) > 20 and not isinstance(message, SystemMessage):
                 try:
-                    self.vector_store.add_documents([Document(page_content=message.content)])
-                    self.logger.debug(f"Added message to vector store: {message.content[:50]}...")
+                    # Consider adding metadata here too
+                    doc = Document(page_content=message.content, metadata={"role": message.type})
+                    self.vector_store.add_documents([doc])
+                    self.logger.debug(f"Added raw message content to vector store: {message.content[:50]}...")
                 except Exception as e:
-                    self.logger.warning(f"Failed to add message to vector store: {e}")
+                    self.logger.warning(f"Failed to add raw message content to vector store: {e}")
 
-            # Save the raw history to JSON incrementally
-            self.save_memory()
+            # Save the raw history to JSON incrementally (optional, could be done at end of session)
+            # self.save_memory() # Uncomment if incremental saving is desired
         except Exception as e:
             self.logger.error(f"Error in add_message: {e}", exc_info=True)
 
     def save_memory(self) -> None:
-        """Save the current raw chat history to a file."""
-        # This now only saves the raw message list for persistence between runs.
-        # The state of memory objects (buffer, entity) is held in memory during a session.
+        """Save the raw chat history (past + current session) to a file."""
+        # This saves the combined history for persistence between application runs.
         self.logger.debug(f"Saving raw memory to file: {self.file_path}")
         try:
-            # Combine past chat history with current session raw history
+            # Combine previously loaded history with the raw history from the current session
             combined_history = self.chat_history + self.current_session_history
             
             with open(self.file_path, 'w') as f:
                 json.dump(combined_history, f, indent=2)
-            self.logger.debug(f"Raw memory saved successfully: {len(combined_history)} messages")
+            self.logger.info(f"Raw memory saved successfully to {self.file_path}: {len(combined_history)} total messages.")
+            # Optional: Clear current_session_history after saving if combining happens elsewhere
+            # self.current_session_history = [] 
         except Exception as e:
-            self.logger.error(f"Error saving raw memory to file: {e}")
-            raise MemorySaveError(f"Error saving raw memory to file: {e}")
+            self.logger.error(f"Error saving raw memory to file {self.file_path}: {e}")
+            # Decide whether to raise MemorySaveError or just log
+            # raise MemorySaveError(f"Error saving raw memory to file: {e}")
 
-    def add_to_vector_store(self, messages: List[BaseMessage]) -> None:
-        """Add messages to vector store for semantic retrieval"""
-        # This method might become redundant if add_message handles vector store updates.
-        # Keeping it for now in case of bulk adds.
-        texts_to_add = []
-        for msg in messages:
-            if isinstance(msg.content, str) and len(msg.content) > 10:
-                self.logger.debug(f"Queueing message for vector store add: {msg.content[:50]}...")
-                texts_to_add.append(msg.content)
-        if texts_to_add and self.vector_store:
-            try:
-                self.vector_store.add_texts(texts_to_add)
-                self.logger.debug(f"Added {len(texts_to_add)} messages to vector store.")
-            except Exception as e:
-                 self.logger.warning(f"Failed to add bulk messages to vector store: {e}")
+    # REMOVED add_to_vector_store - consolidation into add_message/load_memory
 
     def get_chat_history(self) -> List[BaseMessage]:
         """Get the current session chat history from the message_history object."""
+        # This now correctly returns the list of BaseMessage objects held by
+        # the ChatMessageHistory instance managed by RunnableWithMessageHistory.
         return self.message_history.messages

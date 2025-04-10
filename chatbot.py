@@ -1,55 +1,33 @@
 # chatbot.py
 import logging
 import os
+import uuid # For session IDs
 from typing import List, Optional, Dict, Any
-from operator import itemgetter  # Import itemgetter
+from operator import itemgetter
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
-# Ensure ConversationBufferMemory is imported
-try:
-    # Langchain >= 0.3.0
-    from langchain_community.memory import ConversationBufferMemory
-except ImportError:
-    # Fallback for older versions
-    from langchain.memory import ConversationBufferMemory
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda, RunnableConfig
+from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_openai import ChatOpenAI
 from memory_manager import MemoryManager
-from config import (
-    AI_NAME, MEMORY_FILE, OPENAI_MODEL,
-    OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL,
-)
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
-from config import Config
-from utils import process_memory_data, sanitize_user_input, setup_logging, configure_memory_retriever
+from utils import process_memory_data, sanitize_user_input, setup_logging
 from exceptions import APICallError, MemoryLoadError, MemorySaveError
 import re
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
-# Placeholder for sentiment analysis function (Task 4)
-def analyze_sentiment(text: str) -> str:
-    """Placeholder function to analyze sentiment. Returns 'positive', 'negative', or 'neutral'."""
-    # TODO: Replace with actual sentiment analysis logic (e.g., NLTK VADER, HF model)
-    text_lower = text.lower()
-    if "sad" in text_lower or "upset" in text_lower or "bad" in text_lower or "terrible" in text_lower:
-        return "negative"
-    elif "happy" in text_lower or "great" in text_lower or "good" in text_lower or "awesome" in text_lower:
-        return "positive"
-    else:
-        return "neutral"
-
 class Chatbot:
-    def __init__(self, user_name: str = "User", ai_name: str = "Ava", verbose: bool = False):
+    # Now takes a configured MemoryManager instance
+    def __init__(self, memory_manager: MemoryManager, user_name: str = "User", ai_name: str = "Ava", verbose: bool = False, streaming: bool = True):
         self.logger = logging.getLogger(__name__)
         
-        # Set up logging with appropriate verbosity
+        # Set chatbot's logger level ONLY if verbose is explicitly True
+        # Otherwise, it will inherit the level set by setup_logging (e.g., WARNING)
         if verbose:
             self.logger.setLevel(logging.DEBUG)
-        else:
-            self.logger.setLevel(logging.INFO)
             
         # Load API key from environment
         load_dotenv()
@@ -58,105 +36,122 @@ class Chatbot:
             self.logger.error("OpenAI API key not found in environment variables.")
             raise ValueError("OPENAI_API_KEY environment variable not set.")
 
-        # LLM Parameters (configurable)
-        # Temperature: Controls randomness. Lower is more deterministic, higher is more creative.
-        # Top_p: Nucleus sampling. Considers only tokens with cumulative probability mass up to top_p.
-        # Top_k: Considers only the top_k most likely tokens.
-        # Recommendation: Adjust temperature primarily, or use top_p, but generally not both temperature and top_p significantly > 0.
-        self.llm_temperature = 0.7 # Default: Balance creativity/coherence
-        self.llm_top_p = 1.0       # Default: No nucleus sampling unless adjusted
-        self.llm_top_k = 50        # Default: Consider top 50 tokens
-        self.llm_model_name = "gpt-4o-mini" # Or your preferred model
-
-        self.logger.info(f"Initializing LLM: {self.llm_model_name} with temp={self.llm_temperature}, top_p={self.llm_top_p}, top_k={self.llm_top_k}")
-        self.llm = ChatOpenAI(
-            model_name=self.llm_model_name,
+        # LLM Parameters
+        self.llm_temperature = 0.7
+        self.llm_top_p = 1.0
+        self.llm_top_k = 50 # Note: Top K might not be directly used by ChatOpenAI
+        self.llm_model_name = "gpt-4o-mini" # Using a faster model for testing
+        
+        self.streaming = streaming
+        # Use logger.debug for this potentially noisy log message
+        self.logger.debug(f"Initializing LLM: {self.llm_model_name} with temp={self.llm_temperature}, top_p={self.llm_top_p}, streaming={streaming}")
+        
+        # LLM configuration with optional streaming
+        llm_kwargs = {
+            "model_name": self.llm_model_name,
+            "openai_api_key": openai_api_key,
+            "temperature": self.llm_temperature,
+            "top_p": self.llm_top_p, # Pass top_p directly
+            # model_kwargs can be used for less common parameters if needed
+            # "model_kwargs": {}
+        }
+        
+        # Add streaming if requested
+        if streaming:
+            llm_kwargs["streaming"] = True
+            llm_kwargs["callbacks"] = [StreamingStdOutCallbackHandler()]
+            
+        self.llm = ChatOpenAI(**llm_kwargs)
+        
+        # --- Create Sentiment Analysis Chain --- 
+        # Use a separate, non-streaming LLM instance for sentiment to avoid callback interference
+        sentiment_llm = ChatOpenAI(
+            model_name=self.llm_model_name, # Can use the same model or a cheaper/faster one
             openai_api_key=openai_api_key,
-            temperature=self.llm_temperature,
-            model_kwargs={
-                "top_p": self.llm_top_p,
-                # Note: top_k is often not a direct parameter for OpenAI models via Langchain, controlled via top_p/temp primarily.
-                # We include self.llm_top_k for potential future use or other models, but it might not affect GPT-4/3.5 directly here.
-            }
-            # Add other parameters like max_tokens if needed
+            temperature=0.0, # Low temp for deterministic sentiment
+            streaming=False # Ensure this is False
         )
+        sentiment_prompt = ChatPromptTemplate.from_template(
+            "Analyze the sentiment of the following text. Respond with only one word: \'positive\', \'negative\', or \'neutral\'.\n\nText: {user_input}"
+        )
+        # Define the chain: Input dict -> Prompt -> Sentiment LLM -> String Output
+        self.sentiment_chain = (
+            sentiment_prompt 
+            | sentiment_llm 
+            | StrOutputParser()
+        )
+        self.logger.debug("Sentiment analysis chain created with separate LLM instance.")
+        # -------------------------------------
         
         self.user_name = user_name
         self.ai_name = ai_name
+        self.memory_manager = memory_manager # Use the passed-in manager
 
-        # --- Memory Manager --- 
-        # Pass the LLM instance to the MemoryManager
-        # Memory loading is now handled in start_chat()
-        self.memory_manager = MemoryManager(file_path="chat_memory.json", llm=self.llm)
+        # --- Core Chat Chain (without history management) --- 
+        # This defines the logic for a single turn, given context and question
+        core_chat_chain = self._create_core_chat_chain()
 
-        # --- Chat Chain --- 
-        # Create the chat chain. This now uses memory components 
-        # initialized within MemoryManager (e.g., summary_buffer_memory).
-        self.chat_chain = self._create_chat_chain()
+        # --- Chain with History --- 
+        # Wrap the core chain with history management
+        self.chain_with_history = RunnableWithMessageHistory(
+            core_chat_chain, 
+            # Function to retrieve message history based on session_id
+            # Uses the message_history object from the MemoryManager instance
+            lambda session_id: self.memory_manager.message_history, 
+            input_messages_key="question", 
+            history_messages_key="chat_history", # This MUST match the placeholder name in the prompt
+            # output_messages_key="answer" # Optional: If set, AIMessage(content=...) is stored automatically
+        )
 
-        self.logger.info(f"Initialized {self.ai_name} with model {self.llm_model_name}")
+        # Use logger.debug here as well
+        self.logger.debug(f"Initialized {self.ai_name} chatbot with history management.")
     
-    def _create_chat_chain(self):
-        """Creates the Langchain Expression Language (LCEL) chain for the chatbot."""
-        self.logger.debug("Creating chat chain with RAG and sentiment analysis...")
+    def _create_core_chat_chain(self):
+        """Creates the core LCEL chain (without message history wrapper)."""
+        self.logger.debug("Creating core chat chain with RAG and LLM-based sentiment analysis...")
 
-        # Get the base system prompt
         system_prompt = self._get_system_prompt()
 
-        # Define the prompt template
-        # Includes placeholders for history, retrieved context, and the user question
         prompt = ChatPromptTemplate.from_messages([
-            # System prompt instructs how to use context from buffer and RAG
-            ("system", system_prompt + "\n\n[Background Knowledge & Profile Notes]\n{retrieved_context}\n\n[User Sentiment: {user_sentiment}]\n\n[Current Conversation History]\n"),
-            MessagesPlaceholder(variable_name="chat_history"), # From SummaryBufferMemory
-            ("human", "{question}")
+            ("system", system_prompt + "\n\n[Background Knowledge & Profile Notes]\n{retrieved_context}\n\n[User Sentiment: {user_sentiment}]\n\n[Current Conversation History]"),
+            MessagesPlaceholder(variable_name="chat_history"), # Placeholder for history (managed by RunnableWithMessageHistory)
+            ("human", "{question}") # Placeholder for the user's input
         ])
 
-        # Helper function to format retrieved documents
         def format_docs(docs):
-            # Consider adding metadata (e.g., timestamp) to the formatted string
+            if not docs:
+                return "No relevant background knowledge found."
             return "\n\n".join(doc.page_content for doc in docs)
 
-        # Build the chat chain using RunnablePassthrough.assign to load memory components
-        chat_chain = (
+        # Define the sequence of operations for a single turn
+        # Note: chat_history is now implicitly managed by the wrapper
+        core_chain = (
             RunnablePassthrough.assign(
-                # Load history from the summary buffer memory
-                chat_history_messages=RunnableLambda(self.memory_manager.summary_buffer_memory.load_memory_variables) | itemgetter(self.memory_manager.summary_buffer_memory.memory_key),
-                question=itemgetter("question") # Pass the user question through
-            )
-            # Add retrieval step (RAG - Task 2B)
-            .assign(
+                # Retrieve context using the vector retriever from memory_manager
                 retrieved_context=(
                     itemgetter("question") |
-                    self.memory_manager.vector_store.as_retriever(search_kwargs=dict(k=3)) | # Retrieve top 3 relevant docs
+                    (self.memory_manager.vector_retriever if self.memory_manager.vector_retriever else RunnableLambda(lambda x: "No vector retriever available.")) | # Handle case where retriever might be None
                     RunnableLambda(format_docs)
-                )
+                ),
+                # Analyze sentiment using the dedicated LLM chain
+                user_sentiment=RunnableLambda(
+                    lambda x: {"user_input": x["question"]}
+                 ) | self.sentiment_chain,
+                # question is passed through automatically
             )
-            # Ensure chat_history (message list) is available for the prompt
-            .assign(
-                chat_history=itemgetter("chat_history_messages")
-            )
-            # Add Sentiment Analysis step (Task 4)
-            .assign(
-                user_sentiment=itemgetter("question") | RunnableLambda(analyze_sentiment)
-            )
-            # Log input before it hits the prompt template
-            | RunnableLambda(lambda x: self.logger.debug(f"Input to prompt: { {k: v for k, v in x.items() if k not in ['chat_history', 'chat_history_messages']} } | History: {len(x.get('chat_history', []))} messages | Retrieved Context: {x.get('retrieved_context','')[:100]}...") or x)
+            # Log input details before the prompt
+            | RunnableLambda(lambda x: self.logger.debug(f"Input to prompt: { {k: v for k, v in x.items() if k != 'chat_history'} } | History: [Handled by Wrapper]") or x)
             | prompt
             | self.llm
             | StrOutputParser()
         )
 
-        self.logger.debug("Chat chain created successfully with RAG and sentiment analysis steps")
-        return chat_chain
+        self.logger.debug("Core chat chain created.")
+        return core_chain
     
     def _get_system_prompt(self) -> str:
         """Get the system prompt that defines the assistant's capabilities and persona."""
-        # Persona Definition: Aiming for a supportive, curious, engaging friend.
-        # Traits: Empathetic, non-judgmental, good listener, remembers details, maybe slightly humorous/playful but grounded.
-        # Communication Style: Natural, conversational, uses user's name, asks follow-up questions.
-        # Goals: Build rapport, remember user details, provide companionship and thoughtful conversation.
-        # Boundaries: Does not claim sentience, avoids harmful/unethical content, admits limitations.
+        # (System prompt remains largely the same, ensuring it mentions using 'chat_history')
         return (
             f"You are {self.ai_name}, an AI designed to be a supportive and engaging friend. Your goal is to build rapport, provide companionship, and have thoughtful conversations. "
             f"Act as a curious, empathetic, and non-judgmental listener. Remember details the user shares about themselves (like their name, preferences, experiences) and refer back to them when relevant to show you're paying attention. "
@@ -170,116 +165,142 @@ class Chatbot:
             f"Keep your responses helpful, considerate, and focused on being a good conversational partner."
         )
     
-    def save_memory(self) -> None:
-        """Save the raw memory state via the memory manager."""
-        self.logger.debug("Triggering memory save via MemoryManager")
-        try:
-            self.memory_manager.save_memory()
-            self.logger.debug("Memory save triggered successfully")
-        except Exception as e:
-            self.logger.error(f"Error triggering memory save: {e}")
+    # Removed save_memory method - persistence is handled by MemoryManager instance via start_chat loop
 
-    def generate_response(self, user_input: str) -> str:
-        """Generate a response to user input using the memory-enhanced chat chain."""
-        self.logger.debug(f"Generating response to: {user_input}")
+    def generate_response(self, user_input: str, session_id: str) -> str:
+        """Generate a response using the history-aware chain."""
+        self.logger.debug(f"Generating response for session '{session_id}' to: {user_input}")
         
-        # Don't add human message to memory manager here, let memory objects handle it via save_context
+        # Prepare config for RunnableWithMessageHistory
+        config = RunnableConfig(configurable={"session_id": session_id})
         
-        # Generate response using the chat chain
         try:
-            # Invoke chain - memory variables are loaded automatically
-            response = self.chat_chain.invoke({"question": user_input})
+            # Invoke the chain with history management
+            # The wrapper handles loading history, passing it to the core chain,
+            # and saving the human input and AI output to the history object.
+            response = self.chain_with_history.invoke(
+                {"question": user_input}, 
+                config=config
+            )
             
-            # Save context to memory objects *after* getting the response
-            self.memory_manager.save_context({"input": user_input}, {"output": response})
-            # Also save context for entity memory so it updates its store
-            if self.memory_manager.entity_memory:
-                self.memory_manager.entity_memory.save_context({"input": user_input}, {"output": response})
-            
-            # Add messages to MemoryManager for persistent saving
-            # This ensures chat_memory.json is updated correctly for the next session
+            # Manually add raw messages to MemoryManager for JSON persistence
+            # This is separate from the history object used by the chain itself
             human_message = HumanMessage(content=user_input)
             ai_message = AIMessage(content=response)
             self.memory_manager.add_message(human_message)
             self.memory_manager.add_message(ai_message)
             
-            self.logger.debug(f"Generated response: {response}")
-            # Print response to console immediately
-            print(f"{self.ai_name}: {response}") # Added print statement here
+            self.logger.debug(f"Generated response for session '{session_id}': {response[:100]}...")
+            
+            # Only print to console if not using streaming output
+            if not self.streaming:
+                print(f"{self.ai_name}: {response}") 
+            
             return response
             
         except Exception as e:
-            self.logger.error(f"Error generating response: {e}")
+            self.logger.error(f"Error generating response for session '{session_id}': {e}", exc_info=True)
             error_message = "I'm sorry, I encountered an error generating a response. Please try again."
             
             # Add error message to persistent storage via MemoryManager
-            error_ai_message = AIMessage(content=error_message)
-            # We might not want to save the user input that caused the error,
-            # but we should save the AI's error response.
-            self.memory_manager.add_message(error_ai_message)
-            
+            try:
+                error_ai_message = AIMessage(content=error_message)
+                self.memory_manager.add_message(error_ai_message)
+            except Exception as mem_e:
+                 self.logger.error(f"Failed to add error message to memory: {mem_e}")
+
             print(f"{self.ai_name}: {error_message}") # Print error message
             return error_message
 
-    def start_chat(self):
-        """Starts the interactive chat loop."""
-        self.logger.info(f"Starting chat session with {self.ai_name}. Type 'exit' to end.")
-        
-        # Load memory at the beginning of the session
-        try:
-            self.memory_manager.load_memory()
-            self.logger.info("Memory loaded successfully.")
-        except MemoryLoadError as e:
-            self.logger.error(f"Failed to load memory: {e}")
-            # Decide if we should proceed with empty memory or exit
-            # For now, proceed with empty memory
-        
+# --- Interactive Chat Loop (Example Usage - consider moving to main.py or similar) ---
+def start_chat(verbose: bool = False, model_name: str = "gpt-4o-mini", user_name: str = "User", streaming: bool = True):
+    """Starts the interactive chat loop."""
+    ai_name = "Ava"
+    session_id = str(uuid.uuid4()) # Generate a unique session ID
+    memory_file = "chat_memory.json"
+
+    # Use logger configured in __init__ or root
+    logger.debug(f"Starting new chat session: {session_id}") # Changed from INFO to DEBUG
+    
+    # 1. Initialize Memory Manager
+    # LLM is needed for summarization, provide it if available
+    # Load API key here if MemoryManager needs its own LLM instance
+    load_dotenv()
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    llm_for_memory = None
+    if openai_api_key:
+        # Use a cheaper/faster model for background tasks like summarization if possible
+        llm_for_memory = ChatOpenAI(model_name="gpt-4o-mini", openai_api_key=openai_api_key, temperature=0.0) 
+    else:
+        logger.warning("OpenAI API key not found, summarization features will be disabled in MemoryManager.")
+
+    memory_manager = MemoryManager(file_path=memory_file, llm=llm_for_memory)
+    
+    # 2. Load existing memory (populates message_history and vector store)
+    try:
+        memory_manager.load_memory()
+        logger.debug("Memory loaded successfully.") # Changed from INFO to DEBUG
+    except MemoryLoadError as e:
+        logger.error(f"Failed to load memory: {e}")
+        # Proceeding with empty memory
+
+    # 3. Initialize Chatbot with the memory manager
+    # Model name passed here is primarily for display/logging now, LLM is initialized within Chatbot
+    chatbot = Chatbot(
+        memory_manager=memory_manager, 
+        user_name=user_name, 
+        ai_name=ai_name, 
+        verbose=verbose, 
+        streaming=streaming # This controls LLM init behavior
+    )
+    
+    # Use the actual model name from the chatbot instance for the log
+    logger.debug(f"Chatbot initialized. Using model: {chatbot.llm_model_name}") # Changed from INFO to DEBUG
+    
+    print(f"\n{ai_name}: Hello {user_name}! I'm ready to chat. (Session: {session_id}). Type 'exit' to end.")
+
+    # --- Main Loop ---
+    try:
         while True:
-            user_input = input(f"{self.user_name}: ")
+            user_input = input(f"{user_name}: ")
             if user_input.lower() == 'exit':
-                self.logger.info("Exit command received. Processing end-of-session tasks...")
-                # --- Task 3: Post-Session Summarization ---
-                try:
-                    # Get all messages from the current session history managed by the buffer
-                    # Note: summary_buffer_memory holds state via the linked message_history
-                    session_messages = self.memory_manager.message_history.messages
-                    if session_messages:
-                        self.logger.info(f"Creating and storing summary for {len(session_messages)} messages...")
-                        self.memory_manager.create_and_store_session_summary(session_messages)
-                        self.logger.info("Session summary processed and stored.")
-                    else:
-                        self.logger.info("No messages in session to summarize.")
-                except Exception as e:
-                    self.logger.error(f"Error during post-session summarization: {e}", exc_info=True)
-                # --- End Task 3 ---
-                
-                # Optionally, perform final save if needed (though add_message might handle incremental saves)
-                # self.memory_manager.save_memory()
-                self.logger.info("Chat session ended.")
-                break
+                logger.debug("Exit command received. Processing end-of-session tasks...") # Changed from INFO to DEBUG
+                break # Exit the loop
             
-            if not user_input:
-                continue
+            # Generate response using the history-aware chain
+            # Pass the current session_id
+            _ = chatbot.generate_response(user_input, session_id=session_id)
             
-            try:
-                # Add user message to message_history (used by memories) and persistent store
-                user_message = HumanMessage(content=user_input)
-                self.memory_manager.message_history.add_message(user_message)
-                self.memory_manager.add_message(user_message) # Saves to JSON + vector store (raw)
-                
-                # Invoke chain
-                response = self.chat_chain.invoke({"question": user_input})
-                
-                # Add AI response to message_history and persistent store
-                ai_response = AIMessage(content=response)
-                self.memory_manager.message_history.add_message(ai_response)
-                self.memory_manager.add_message(ai_response) # Saves to JSON + vector store (raw)
-                
-                print(f"{self.ai_name}: {response}")
-                
-            except APICallError as e:
-                self.logger.error(f"API Call Error: {e}")
-                print("Sorry, there was an error communicating with the AI service.")
-            except Exception as e:
-                self.logger.error(f"An unexpected error occurred: {e}", exc_info=True)
-                print("Sorry, an unexpected error occurred.")
+            # Ensure a newline after streaming output before the next input prompt
+            if chatbot.streaming:
+                print() # Add a newline for better formatting after streaming
+
+    finally:
+        # --- End of Session Tasks ---
+        logger.debug("Performing end-of-session tasks...") # Changed from INFO to DEBUG
+        # 1. Save the raw memory log
+        try:
+            memory_manager.save_memory()
+            logger.debug("Raw memory log saved.") # Changed from INFO to DEBUG
+        except MemorySaveError as e:
+            logger.error(f"Failed to save memory log: {e}")
+            
+        # 2. Create and store session summary (uses the history from memory_manager.message_history)
+        try:
+            session_messages = memory_manager.get_chat_history() # Get messages from the ChatMessageHistory object
+            if session_messages:
+                logger.debug(f"Creating and storing summary for {len(session_messages)} messages from session {session_id}...") # Changed from INFO to DEBUG
+                memory_manager.create_and_store_session_summary(session_messages)
+                logger.debug("Session summary processed and potentially stored.") # Changed from INFO to DEBUG
+            else:
+                logger.debug("No messages in session history to summarize.") # Changed from INFO to DEBUG
+        except Exception as e:
+            logger.error(f"Error during session summary processing: {e}", exc_info=True)
+            
+        logger.debug(f"Chat session {session_id} ended.") # Changed from INFO to DEBUG
+
+# Example of how to run this if executed directly
+# if __name__ == '__main__':
+#     # Setup logging here if running as main script
+#     setup_logging(level=logging.INFO) 
+#     start_chat(verbose=False) # Set verbose=True for more detailed logs

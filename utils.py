@@ -8,39 +8,45 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 
 logger = logging.getLogger(__name__)
 
-def setup_logging(verbose: bool = False) -> None:
+def setup_logging(verbose: bool = False, level: int = logging.INFO, log_format: str = '%(asctime)s - %(name)s - %(levelname)s - %(message)s') -> None:
     """
     Set up logging configuration.
     
     Args:
-        verbose: Whether to enable verbose logging
+        verbose: Whether to enable verbose logging (overrides level to DEBUG).
+        level: The default logging level if verbose is False.
+        log_format: The format string for log messages.
     """
-    log_level = logging.DEBUG if verbose else logging.INFO
+    # Determine the final log level
+    log_level = logging.DEBUG if verbose else level
+    
+    # If not verbose, set the default level to WARNING
+    if not verbose:
+        log_level = logging.WARNING
     
     # Configure root logger
+    # Remove existing handlers to avoid duplicate logs if called multiple times
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+        
     logging.basicConfig(
         level=log_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format=log_format,
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    # Silence noisy loggers
+    # Silence excessively noisy third-party loggers
     logging.getLogger("openai").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    
-    # Set up debug logger if verbose
+    logging.getLogger("httpcore").setLevel(logging.WARNING) # Added for httpx dependency
+    logging.getLogger("faiss").setLevel(logging.WARNING) # Silence FAISS info logs
+    logging.getLogger("nomic").setLevel(logging.WARNING) # Silence Nomic info logs (if any)
+
     if verbose:
-        # Create a logger for detailed debugging
-        debug_logger = logging.getLogger("debug")
-        debug_logger.setLevel(logging.DEBUG)
-        
-        # Add handler for debug logs
-        debug_handler = logging.StreamHandler()
-        debug_handler.setLevel(logging.DEBUG)
-        debug_handler.setFormatter(logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        ))
-        debug_logger.addHandler(debug_handler)
+        logger.info(f"Verbose logging enabled. Root logger level set to DEBUG.")
+    else:
+        logger.debug(f"Standard logging enabled. Root logger level set to {logging.getLevelName(log_level)}.")
+        # Add a debug log to confirm non-verbose mode is active, won't show unless root is DEBUG
 
 def process_memory_data(memory_data: List[Dict]) -> List[BaseMessage]:
     """
@@ -53,13 +59,26 @@ def process_memory_data(memory_data: List[Dict]) -> List[BaseMessage]:
         A list of BaseMessage objects
     """
     messages = []
+    # Check if memory_data is indeed a list
+    if not isinstance(memory_data, list):
+        logger.error(f"Invalid memory data format: Expected list, got {type(memory_data)}")
+        return []
+        
     for item in memory_data:
-        if item.get("role") == "user":
-            messages.append(HumanMessage(content=item.get("content", "")))
-        elif item.get("role") == "ai":
-            messages.append(AIMessage(content=item.get("content", "")))
-        elif item.get("role") == "system":
-            messages.append(SystemMessage(content=item.get("content", "")))
+        # Ensure item is a dictionary and has 'role' and 'content'
+        if isinstance(item, dict) and 'role' in item and 'content' in item:
+            role = item.get("role")
+            content = item.get("content", "")
+            if role == "user" or role == "human": # Accept both 'user' and 'human'
+                messages.append(HumanMessage(content=content))
+            elif role == "ai" or role == "assistant": # Accept both 'ai' and 'assistant'
+                messages.append(AIMessage(content=content))
+            elif role == "system":
+                messages.append(SystemMessage(content=content))
+            else:
+                logger.warning(f"Unsupported role found in memory data: {role}")
+        else:
+            logger.warning(f"Skipping invalid memory item: {item}")
     return messages
 
 def sanitize_user_input(input_text: str) -> str:
@@ -73,7 +92,7 @@ def sanitize_user_input(input_text: str) -> str:
         Sanitized input text
     """
     # Remove any attempt to impersonate system or control messages
-    sanitized = re.sub(r'(system|user|assistant):', '', input_text)
+    sanitized = re.sub(r'(system|user|assistant):', '', input_text, flags=re.IGNORECASE)
     
     # Remove any markdown code block syntax that might be confused with system instructions
     sanitized = re.sub(r'```.*?```', '[code removed]', sanitized, flags=re.DOTALL)
@@ -106,9 +125,17 @@ def format_context_for_prompt(context_data: Dict[str, Any]) -> List[BaseMessage]
     if 'entities' in context_data and context_data['entities']:
         try:
             if isinstance(context_data['entities'], str):
-                entities = json.loads(context_data['entities'])
+                # Attempt to load if it's a JSON string
+                try:
+                    entities = json.loads(context_data['entities'])
+                except json.JSONDecodeError:
+                    logger.warning(f"Could not decode entity data string: {context_data['entities']}")
+                    entities = None # Treat as invalid
+            elif isinstance(context_data['entities'], dict):
+                 entities = context_data['entities']
             else:
-                entities = context_data['entities']
+                logger.warning(f"Unexpected type for entity data: {type(context_data['entities'])}")
+                entities = None
                 
             if entities:
                 entities_message = "The following entities have been mentioned:"
@@ -117,14 +144,25 @@ def format_context_for_prompt(context_data: Dict[str, Any]) -> List[BaseMessage]
                 messages.append(SystemMessage(content=entities_message))
         except Exception as e:
             # Log but continue without entities
-            logging.warning(f"Error formatting entity data: {e}")
+            logger.warning(f"Error formatting entity data: {e}")
     
     # Add relevant documents if available
     if 'documents' in context_data and context_data['documents']:
         docs = context_data['documents']
         if isinstance(docs, list) and docs:
-            docs_message = "Previous conversations contained the following relevant information:\n"
-            docs_message += "\n---\n".join(docs)
-            messages.append(SystemMessage(content=docs_message))
+            # Check if docs are strings or have page_content
+            formatted_docs = []
+            for doc in docs:
+                if isinstance(doc, str):
+                    formatted_docs.append(doc)
+                elif hasattr(doc, 'page_content'):
+                    formatted_docs.append(doc.page_content)
+                else:
+                     logger.warning(f"Skipping document with unexpected format: {type(doc)}")
+            
+            if formatted_docs:
+                docs_message = "Previous conversations contained the following relevant information:\n"
+                docs_message += "\n---\n".join(formatted_docs)
+                messages.append(SystemMessage(content=docs_message))
     
     return messages
