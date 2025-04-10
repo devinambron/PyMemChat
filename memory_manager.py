@@ -21,6 +21,7 @@ try:
     from langchain_community.memory import (
         ConversationBufferMemory, 
         ConversationSummaryMemory,
+        ConversationSummaryBufferMemory,
         ConversationEntityMemory,
         CombinedMemory,
         VectorStoreRetrieverMemory
@@ -30,6 +31,7 @@ except ImportError:
     from langchain.memory import (
         ConversationBufferMemory, 
         ConversationSummaryMemory,
+        ConversationSummaryBufferMemory,
         ConversationEntityMemory,
         CombinedMemory,
         VectorStoreRetrieverMemory
@@ -69,6 +71,23 @@ class MemoryManager:
             )
         else:
             self.entity_memory = None # No LLM, no entity memory
+        
+        # Initialize ConversationSummaryBufferMemory (uses message_history)
+        # Configured for large context window as per Task 2A
+        if self.llm:
+            self.summary_buffer_memory = ConversationSummaryBufferMemory(
+                llm=self.llm,
+                chat_message_history=self.message_history, # Link to the shared history
+                max_token_limit=80000, # Utilize large context window
+                memory_key="chat_history", # Standard key for chat history
+                return_messages=True # Return BaseMessage objects for LCEL
+            )
+        else:
+            # Provide a fallback or raise an error if LLM is needed but not provided
+            self.logger.warning("LLM not provided, ConversationSummaryBufferMemory requires an LLM. Falling back to basic history or potentially erroring.")
+            # Decide on fallback behavior: maybe a simple buffer or raise error
+            # For now, let's set it to None, but Chatbot logic must handle this.
+            self.summary_buffer_memory = None
         
         # Conversation summary (still potentially useful for simple context)
         self.summary = ""
@@ -223,9 +242,64 @@ If there's no previous summary, create a new summary. Keep the summary concise."
             # Ensure silent mode is off after loading
             self.silent_mode = False
             self.session_started = True
-    
+            
+    def create_and_store_session_summary(self, messages: List[BaseMessage]) -> None:
+        """Generates a summary of the provided messages using the LLM and stores it in the vector store."""
+        if not self.llm:
+            self.logger.warning("LLM is not available, cannot generate session summary.")
+            return
+        if not self.vector_store:
+            self.logger.warning("Vector store is not available, cannot store session summary.")
+            return
+        if not messages:
+            self.logger.info("No messages provided to summarize.")
+            return
+            
+        self.logger.debug(f"Starting summary generation for {len(messages)} messages.")
+        
+        # Format messages for the prompt
+        formatted_messages = "\n".join([f"{msg.type.upper()}: {msg.content}" for msg in messages])
+        
+        # Define summarization prompt
+        summarization_prompt_template = ChatPromptTemplate.from_messages([
+            ("system", 
+             "You are an expert in summarizing conversations. Analyze the following conversation transcript. "
+             "Extract key facts learned about the user (e.g., name, specific preferences like favorite color, stated goals, significant life events mentioned), "
+             "and identify the main topics discussed. Generate a concise summary focusing *only* on information crucial for remembering the user "
+             "and maintaining context in future interactions. Structure the output clearly, perhaps using bullet points for facts/preferences. "
+             "Do not include conversational fluff. If no significant new information was revealed, state that clearly."
+            ),
+            ("human", "Conversation Transcript:\n---\n{conversation_text}\n---\n\nConcise Summary for Future Recall:")
+        ])
+        
+        # Create summarization chain
+        summarization_chain = summarization_prompt_template | self.llm | StrOutputParser()
+        
+        try:
+            # Invoke the chain
+            summary_text = summarization_chain.invoke({"conversation_text": formatted_messages})
+            self.logger.info(f"Generated session summary: {summary_text[:200]}...")
+            
+            if summary_text and "no significant new information" not in summary_text.lower():
+                # Create a Document for the vector store
+                # Add metadata, e.g., timestamp (optional)
+                from datetime import datetime
+                summary_doc = Document(
+                    page_content=f"Summary of conversation ending around {datetime.now().strftime('%Y-%m-%d %H:%M')}:\n{summary_text}",
+                    metadata={"source": "session_summary", "timestamp": datetime.now().isoformat()}
+                )
+                
+                # Add to vector store
+                self.vector_store.add_documents([summary_doc])
+                self.logger.info("Session summary added to vector store.")
+            else:
+                self.logger.info("Summary deemed not significant enough or empty; not adding to vector store.")
+                
+        except Exception as e:
+            self.logger.error(f"Error during summary generation or storage: {e}", exc_info=True)
+
     def add_message(self, message: BaseMessage) -> None:
-        """Add a message to the raw chat history for persistent saving and update vector store."""
+        """Add a message to the raw chat history for persistent saving and update vector store (for raw messages)."""
         try:
             message_dict = {
                 "role": "user" if isinstance(message, HumanMessage) else "ai" if isinstance(message, AIMessage) else "system",
