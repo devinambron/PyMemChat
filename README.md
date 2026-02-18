@@ -32,7 +32,7 @@ export OPENAI_API_KEY="sk-..."
 Run the chat CLI:
 
 ```bash
-python -m app.main chat --user myname
+python -m app.main --user myname
 ```
 
 Options:

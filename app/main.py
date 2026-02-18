@@ -15,11 +15,10 @@ logger = logging.getLogger(__name__)
 app = typer.Typer(add_completion=False, help="PyMemChat — a lightweight chatbot with semantic memory.")
 
 
-@app.command()
-def chat(
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
-    user: str = typer.Option("default", "--user", help="User id for memory namespacing."),
-    clear_memory: bool = typer.Option(False, "--clear-memory", help="Clear memory before starting."),
+def _run_chat(
+    verbose: bool,
+    user: str,
+    clear_memory: bool,
 ) -> None:
     setup_logging(verbose)
 
@@ -102,10 +101,17 @@ def chat(
             console.print(f"[bold red]Error:[/bold red] {e}")
 
 
-def main() -> None:
-    app()
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
+    user: str = typer.Option("default", "--user", help="User id for memory namespacing."),
+    clear_memory: bool = typer.Option(False, "--clear-memory", help="Clear memory before starting."),
+) -> None:
+    if ctx.invoked_subcommand is None:
+        _run_chat(verbose=verbose, user=user, clear_memory=clear_memory)
 
 
 if __name__ == "__main__":
-    main()
+    app()
 
