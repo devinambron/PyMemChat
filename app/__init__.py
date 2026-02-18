@@ -1,0 +1,2 @@
+"""PyMemChat application package."""
+

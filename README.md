@@ -1,83 +1,75 @@
 # PyMemChat
 
-PyMemChat is an open-source chatbot application that utilizes memory management to enhance user interactions. The chatbot remembers previous conversations, allowing for a more personalized and context-aware experience. It leverages the OpenAI API to generate responses based on user input.
+A lightweight, self-hosted chatbot with semantic memory — your conversations, your data, no cloud lock-in.
 
 ## Features
 
-- Memory management to retain conversation history.
-- Integration with OpenAI's GPT model for generating responses.
-- Verbose logging for debugging and monitoring.
-
-## File Structure
-
-```
-PyMemChat/
-│
-├── chatbot.py          # Main chatbot logic and interaction handling.
-├── config.py           # Configuration settings, including API keys and model parameters.
-├── exceptions.py       # Custom exception classes for error handling.
-├── main.py             # Entry point for running the application.
-├── memory_manager.py    # Handles loading and saving conversation memory.
-├── utils.py            # Utility functions for logging and processing data.
-└── requirements.txt    # List of dependencies for the project.
-```
+- **Modern LangChain composition**: Uses `RunnableWithMessageHistory` for in-session history.
+- **Semantic memory**: Uses `mem0` to store and retrieve relevant past conversation snippets.
+- **Clean CLI UX**: Typer-powered command with Rich output, plus inline chat commands.
+- **Provider flexibility**: Works with OpenAI-compatible endpoints via `base_url`.
 
 ## Installation
 
-To set up a virtual environment for this project, follow these steps:
-
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/yourusername/PyMemChat.git
-   cd PyMemChat
-   ```
-
-2. **Create a virtual environment:**
-   ```bash
-   python -m venv pymemchat-env
-   ```
-
-3. **Activate the virtual environment:**
-   - On Windows:
-     ```bash
-     pymemchat-env\Scripts\activate
-     ```
-   - On macOS/Linux:
-     ```bash
-     source pymemchat-env/bin/activate
-     ```
-
-4. **Install the required packages:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## Running the Project
-
-To run the chatbot, use the following command:
-
 ```bash
-python main.py -v
+git clone https://github.com/devinambron/PyMemChat.git
+cd PyMemChat
+
+python -m venv .venv
+source .venv/bin/activate
+
+pip install -e ".[dev]"
 ```
 
-The `-v` flag enables verbose logging for debugging purposes.
+Set your API key:
 
-## How It Works
+```bash
+export OPENAI_API_KEY="sk-..."
+```
 
-1. **Initialization**: The `main.py` script initializes the application, sets up logging, and creates an instance of the `Chatbot` class.
+## Usage
 
-2. **Chatbot Logic**: The `chatbot.py` file contains the core logic for handling user interactions. It manages memory through the `MemoryManager` class and generates responses using the OpenAI API.
+Run the chat CLI:
 
-3. **Memory Management**: The `memory_manager.py` file is responsible for loading and saving conversation history to a JSON file, allowing the chatbot to remember past interactions.
+```bash
+python -m app.main chat --user myname
+```
 
-4. **Utilities**: The `utils.py` file provides helper functions for logging and processing user input and memory data.
+Options:
 
-5. **Configuration**: The `config.py` file holds configuration settings, including API keys and model parameters.
+- `--verbose / -v`: Show debug output and memory context injections.
+- `--user`: Namespaces semantic memory by user id (default: `default`).
+- `--clear-memory`: Clears semantic memory for the user before starting.
+
+Inline commands during chat:
+
+- `/memory`: Print the last 5 stored memories for the current user.
+- `/clear`: Wipe memory for the current user.
+
+## How Memory Works
+
+Older versions of PyMemChat stored conversation history in a flat JSON file and replayed it verbatim. This modern version uses **mem0 semantic memory**:
+
+- Each user/assistant turn is stored as a memory item.
+- On each new user input, PyMemChat performs a **semantic search** against stored memories.
+- The most relevant results are injected into the model as a **system message** labeled “Relevant memory context:” above the current session’s chat history.
+
+This keeps prompts focused (only the most relevant history is surfaced) while still preserving long-term context.
+
+## Provider Compatibility
+
+PyMemChat uses the OpenAI SDK + `langchain-openai` and supports OpenAI-compatible providers via `base_url`.
+
+- **OpenAI** (default): `OPENAI_API_BASE=https://api.openai.com/v1`
+- **OpenRouter**: set `OPENAI_API_BASE` to the OpenRouter base URL and use your OpenRouter API key.
+- **Ollama**: set `OPENAI_API_BASE` to your local OpenAI-compatible endpoint (e.g., an OpenAI-compatible proxy in front of Ollama).
+
+Environment variables:
+
+- `OPENAI_API_KEY`: API key for the provider.
+- `OPENAI_API_BASE`: Base URL for the provider (defaults to OpenAI).
+- `PYMEMCHAT_USER_ID`: Default user id if not provided via `--user`.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a pull request or open an issue.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+PRs welcome — please include a short test plan and run `pytest`.
